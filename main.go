@@ -232,8 +232,13 @@ func run() error {
 	if *verboseArg {
 		log.SetLevel(log.TraceLevel)
 	}
+	
+	host := *hostArg
+	if host == "" {
+		host = os.Getenv("UNIFI_HOST")
+	}
 
-	unifiFirewall, err := NewUnifiFirewall(*hostArg)
+	unifiFirewall, err := NewUnifiFirewall(host)
 	if err != nil {
 		return err
 	}
