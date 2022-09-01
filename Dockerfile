@@ -19,4 +19,4 @@ ENV UNIFI_PASS=""
 ENV UNIFI_HOST=""
 
 # Run the server executable
-CMD [ "/app/server", "--insecure", "--port=8080", "--host=\"$UNIFI_HOST\"" ]
+CMD [ "/app/server", "--insecure", "--port=8080" ]
