@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"strings"
 
 	"github.com/dgrijalva/jwt-go"
+	"github.com/gorilla/mux"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -24,6 +26,7 @@ var (
 	passwordArg    = flag.String("pass", "", "Unifi password")
 	disableRuleArg = flag.String("disable-rule", "", "Disable the rule")
 	enableRuleArg  = flag.String("enable-rule", "", "Enable the rule")
+	portArg        = flag.Int("port", 0, "Http port to host a proxy server")
 )
 
 type Rule struct {
@@ -152,7 +155,7 @@ func (uf UnifiFirewall) GetRules() (map[string]Rule, error) {
 		return nil, fmt.Errorf("failed to list rules: %d", resp.StatusCode)
 	}
 
-	listRulesBytes, err := ioutil.ReadAll(resp.Body)
+	listRulesBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -253,35 +256,91 @@ func run() error {
 		return err
 	}
 
-	if *disableRuleArg != "" {
+	lookupRuleID := func(ruleQuery string) string {
 		for id, rule := range rules {
-			if *disableRuleArg == id || *disableRuleArg == rule.Name {
-				if !rule.Enabled {
-					fmt.Printf("Rule '%s' is already disabled", rule.Name)
-				} else {
-					if err := unifiFirewall.SetRuleEnabled(id, false); err != nil {
-						return err
-					}
-					fmt.Printf("Rule '%s' has been disabled", *disableRuleArg)
-				}
-
-				return nil
+			if ruleQuery == id || ruleQuery == rule.Name {
+				return id
 			}
 		}
-	} else if *enableRuleArg != "" {
-		for id, rule := range rules {
-			if *enableRuleArg == id || *enableRuleArg == rule.Name {
-				if rule.Enabled {
-					fmt.Printf("Rule '%s' is already enabled", rule.Name)
-				} else {
-					if err := unifiFirewall.SetRuleEnabled(id, true); err != nil {
-						return err
-					}
-					fmt.Printf("Rule '%s' has been enabled", *enableRuleArg)
-				}
+		return ""
+	}
 
-				return nil
+	if *portArg > 0 {
+		// serve as HTTP proxy
+		router := mux.NewRouter()
+		router.HandleFunc("/rules", func(w http.ResponseWriter, r *http.Request) {
+			rules, err := unifiFirewall.GetRules()
+			if err != nil {
+				w.WriteHeader(500)
+				return
 			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(rules)
+		}).Methods(http.MethodGet)
+
+		router.HandleFunc("/rules", func(w http.ResponseWriter, r *http.Request) {
+			type ChangeRule struct {
+				Name    string `json:"name"`
+				Enabled bool   `json:"enabled"`
+			}
+
+			changeRule := ChangeRule{}
+
+			if err := json.NewDecoder(r.Body).Decode(&changeRule); err != nil {
+				log.Errorf("Failed to decode ChangeRule, %v", err)
+				http.Error(w, "Error decoding ChangeRule", http.StatusBadRequest)
+				return
+			}
+
+			changeRule.Name = strings.TrimSpace(changeRule.Name)
+			ruleID := lookupRuleID(changeRule.Name)
+			if changeRule.Name == "" || ruleID == "" {
+				log.Errorf("Invalid rule name")
+				http.Error(w, "Invalid rule name", http.StatusBadRequest)
+				return
+			}
+
+			if err := unifiFirewall.SetRuleEnabled(ruleID, changeRule.Enabled); err != nil {
+				log.Errorf("Failed to set rule %s enabled to %v, %v", changeRule.Name, changeRule.Enabled, err)
+				http.Error(w, "Error setting rule enabled", http.StatusInternalServerError)
+				return
+			}
+
+			w.WriteHeader(http.StatusAccepted)
+		}).Methods(http.MethodPost)
+
+		log.Infof("Listening on %d...", *portArg)
+		http.ListenAndServe(fmt.Sprintf(":%d", *portArg), router)
+	} else if *disableRuleArg != "" {
+		ruleID := lookupRuleID(*disableRuleArg)
+		if ruleID == "" {
+			log.Errorf("Rule not found for '%s'", *disableRuleArg)
+			return nil
+		}
+		rule := rules[ruleID]
+		if !rule.Enabled {
+			fmt.Printf("Rule '%s' is already disabled", rule.Name)
+		} else {
+			if err := unifiFirewall.SetRuleEnabled(ruleID, false); err != nil {
+				return err
+			}
+			fmt.Printf("Rule '%s' has been disabled", *disableRuleArg)
+		}
+	} else if *enableRuleArg != "" {
+		ruleID := lookupRuleID(*enableRuleArg)
+		if ruleID == "" {
+			log.Errorf("Rule not found for '%s'", *enableRuleArg)
+			return nil
+		}
+		rule := rules[ruleID]
+		if rule.Enabled {
+			fmt.Printf("Rule '%s' is already enabled", rule.Name)
+		} else {
+			if err := unifiFirewall.SetRuleEnabled(ruleID, true); err != nil {
+				return err
+			}
+			fmt.Printf("Rule '%s' has been enabled", *enableRuleArg)
 		}
 	} else {
 		rulesBytes, err := json.MarshalIndent(rules, "", "  ")
