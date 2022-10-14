@@ -36,13 +36,15 @@ type Rule struct {
 }
 
 type UnifiFirewall struct {
-	Host string
+	Host     string
+	Username string
+	password string
 
 	csrfToken string
 	client    *http.Client
 }
 
-func NewUnifiFirewall(host string) (*UnifiFirewall, error) {
+func NewUnifiFirewall(host, username, password string) (*UnifiFirewall, error) {
 	if host == "" {
 		return nil, fmt.Errorf("missing host")
 	}
@@ -60,18 +62,20 @@ func NewUnifiFirewall(host string) (*UnifiFirewall, error) {
 	}
 
 	return &UnifiFirewall{
-		Host:   host,
-		client: client,
+		Host:     host,
+		Username: username,
+		password: password,
+		client:   client,
 	}, nil
 }
 
-func (uf *UnifiFirewall) Login(username, password string) error {
+func (uf *UnifiFirewall) Login() error {
 	type LoginRequest struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
 
-	reqBytes, err := json.Marshal(LoginRequest{username, password})
+	reqBytes, err := json.Marshal(LoginRequest{uf.Username, uf.password})
 	if err != nil {
 		return err
 	}
@@ -84,7 +88,7 @@ func (uf *UnifiFirewall) Login(username, password string) error {
 
 	log.WithFields(log.Fields{
 		"host":     uf.Host,
-		"username": username,
+		"username": uf.Username,
 	}).Info("Logging in...")
 	resp, err := uf.client.Do(req)
 	if err != nil {
@@ -94,7 +98,7 @@ func (uf *UnifiFirewall) Login(username, password string) error {
 	if resp.StatusCode != 200 {
 		log.WithFields(log.Fields{
 			"host":        uf.Host,
-			"username":    username,
+			"username":    uf.Username,
 			"status_code": resp.StatusCode,
 		}).Error("Failed to login")
 		return fmt.Errorf("failed to login: %d", resp.StatusCode)
@@ -108,7 +112,7 @@ func (uf *UnifiFirewall) Login(username, password string) error {
 
 		log.WithFields(log.Fields{
 			"host":     uf.Host,
-			"username": username,
+			"username": uf.Username,
 			"token":    cookie.Value,
 		}).Debug("Received token cookie")
 
@@ -116,7 +120,7 @@ func (uf *UnifiFirewall) Login(username, password string) error {
 		if token == nil {
 			log.WithFields(log.Fields{
 				"host":     uf.Host,
-				"username": username,
+				"username": uf.Username,
 			}).Error("Token is malformed")
 			return fmt.Errorf("token is malformed")
 		}
@@ -127,7 +131,7 @@ func (uf *UnifiFirewall) Login(username, password string) error {
 	return nil
 }
 
-func (uf UnifiFirewall) GetRules() (map[string]Rule, error) {
+func (uf *UnifiFirewall) GetRules() (map[string]Rule, error) {
 	type ListRulesResponse struct {
 		Meta  map[string]string `json:"meta"`
 		Rules []Rule            `json:"data"`
@@ -147,7 +151,17 @@ func (uf UnifiFirewall) GetRules() (map[string]Rule, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+
+	if resp.StatusCode == 401 {
+		if err := uf.Login(); err != nil {
+			log.WithFields(log.Fields{
+				"host":        uf.Host,
+				"status_code": resp.StatusCode,
+			}).Error("Failed to list rules")
+			return nil, fmt.Errorf("failed to list rules: %d (%v)", resp.StatusCode, err)
+		}
+		return uf.GetRules()
+	} else if resp.StatusCode != 200 {
 		log.WithFields(log.Fields{
 			"host":        uf.Host,
 			"status_code": resp.StatusCode,
@@ -176,7 +190,7 @@ func (uf UnifiFirewall) GetRules() (map[string]Rule, error) {
 	return ruleIdToRule, nil
 }
 
-func (uf UnifiFirewall) FindRule(ruleQuery string) (*Rule, error) {
+func (uf *UnifiFirewall) FindRule(ruleQuery string) (*Rule, error) {
 	rules, err := uf.GetRules()
 	if err != nil {
 		return nil, err
@@ -193,7 +207,7 @@ func (uf UnifiFirewall) FindRule(ruleQuery string) (*Rule, error) {
 	return nil, nil
 }
 
-func (uf UnifiFirewall) SetRuleEnabled(ruleQuery string, enabled bool) error {
+func (uf *UnifiFirewall) SetRuleEnabled(ruleQuery string, enabled bool) error {
 	rule, err := uf.FindRule(ruleQuery)
 	if err != nil {
 		return err
@@ -235,7 +249,17 @@ func (uf UnifiFirewall) SetRuleEnabled(ruleQuery string, enabled bool) error {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+
+	if resp.StatusCode == 401 {
+		if err := uf.Login(); err != nil {
+			log.WithFields(log.Fields{
+				"host":        uf.Host,
+				"status_code": resp.StatusCode,
+			}).Error("Failed to list rules")
+			return fmt.Errorf("failed to update rule %s: %d (%v)", rule.ID, resp.StatusCode, err)
+		}
+		return uf.SetRuleEnabled(ruleQuery, enabled)
+	} else if resp.StatusCode != 200 {
 		log.WithFields(log.Fields{
 			"host":        uf.Host,
 			"rule_id":     rule.ID,
@@ -269,12 +293,6 @@ func run() error {
 	if host == "" {
 		host = os.Getenv("UNIFI_HOST")
 	}
-
-	unifiFirewall, err := NewUnifiFirewall(host)
-	if err != nil {
-		return err
-	}
-
 	username := *usernameArg
 	if username == "" {
 		username = os.Getenv("UNIFI_USER")
@@ -284,11 +302,11 @@ func run() error {
 		password = os.Getenv("UNIFI_PASS")
 	}
 
-	if err := unifiFirewall.Login(username, password); err != nil {
+	unifiFirewall, err := NewUnifiFirewall(host, username, password)
+	if err != nil {
 		return err
 	}
 
-	// Check for valid auth
 	rules, err := unifiFirewall.GetRules()
 	if err != nil {
 		return err
