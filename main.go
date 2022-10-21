@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -27,6 +28,7 @@ var (
 	disableRuleArg = flag.String("disable-rule", "", "Disable the rule")
 	enableRuleArg  = flag.String("enable-rule", "", "Enable the rule")
 	portArg        = flag.Int("port", 0, "Http port to host a proxy server")
+	errNeedsLogin  = errors.New("Login required")
 )
 
 type Rule struct {
@@ -36,98 +38,62 @@ type Rule struct {
 }
 
 type UnifiFirewall struct {
-	Host string
+	Host     string
+	Username string
+	password string
 
 	csrfToken string
 	client    *http.Client
 }
 
-func NewUnifiFirewall(host string) (*UnifiFirewall, error) {
+func NewUnifiFirewall(host, username, password string) (*UnifiFirewall, error) {
 	if host == "" {
 		return nil, fmt.Errorf("missing host")
 	}
 
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return nil, err
-	}
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: *insecureArg},
-	}
 	client := &http.Client{
-		Jar:       jar,
-		Transport: tr,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: *insecureArg},
+		},
 	}
 
 	return &UnifiFirewall{
-		Host:   host,
-		client: client,
+		Host:     host,
+		Username: username,
+		password: password,
+		client:   client,
 	}, nil
 }
 
-func (uf *UnifiFirewall) Login(username, password string) error {
-	type LoginRequest struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
+func (uf *UnifiFirewall) findRule(ruleQuery string) (*Rule, error) {
+	rules, err := uf.getRules()
+	if err != nil {
+		return nil, err
 	}
 
-	reqBytes, err := json.Marshal(LoginRequest{username, password})
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest("POST", uf.Host+"/api/auth/login", bytes.NewBuffer(reqBytes))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
+	ruleQuery = strings.TrimSpace(ruleQuery)
 
-	log.WithFields(log.Fields{
-		"host":     uf.Host,
-		"username": username,
-	}).Info("Logging in...")
-	resp, err := uf.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		log.WithFields(log.Fields{
-			"host":        uf.Host,
-			"username":    username,
-			"status_code": resp.StatusCode,
-		}).Error("Failed to login")
-		return fmt.Errorf("failed to login: %d", resp.StatusCode)
-	}
-
-	cookies := resp.Cookies()
-	for _, cookie := range cookies {
-		if cookie.Name != "TOKEN" {
-			continue
+	for id, rule := range rules {
+		if ruleQuery == id || ruleQuery == rule.Name {
+			return &rule, nil
 		}
-
-		log.WithFields(log.Fields{
-			"host":     uf.Host,
-			"username": username,
-			"token":    cookie.Value,
-		}).Debug("Received token cookie")
-
-		token, _ := jwt.Parse(cookie.Value, nil)
-		if token == nil {
-			log.WithFields(log.Fields{
-				"host":     uf.Host,
-				"username": username,
-			}).Error("Token is malformed")
-			return fmt.Errorf("token is malformed")
-		}
-
-		uf.csrfToken = token.Claims.(jwt.MapClaims)["csrfToken"].(string)
 	}
 
-	return nil
+	return nil, nil
 }
 
-func (uf UnifiFirewall) GetRules() (map[string]Rule, error) {
+func (uf *UnifiFirewall) FindRule(ruleQuery string) (*Rule, error) {
+	val, err := uf.doAndMaybeLogin(func() (any, error) {
+		return uf.findRule(ruleQuery)
+	})
+	if err != nil {
+		return nil, err
+	} else {
+		return val.(*Rule), nil
+	}
+}
+
+func (uf *UnifiFirewall) getRules() (map[string]Rule, error) {
 	type ListRulesResponse struct {
 		Meta  map[string]string `json:"meta"`
 		Rules []Rule            `json:"data"`
@@ -147,7 +113,10 @@ func (uf UnifiFirewall) GetRules() (map[string]Rule, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+
+	if resp.StatusCode == 401 {
+		return nil, errNeedsLogin
+	} else if resp.StatusCode != 200 {
 		log.WithFields(log.Fields{
 			"host":        uf.Host,
 			"status_code": resp.StatusCode,
@@ -176,24 +145,87 @@ func (uf UnifiFirewall) GetRules() (map[string]Rule, error) {
 	return ruleIdToRule, nil
 }
 
-func (uf UnifiFirewall) FindRule(ruleQuery string) (*Rule, error) {
-	rules, err := uf.GetRules()
+func (uf *UnifiFirewall) GetRules() (map[string]Rule, error) {
+	val, err := uf.doAndMaybeLogin(func() (any, error) {
+		return uf.getRules()
+	})
 	if err != nil {
 		return nil, err
+	} else {
+		return val.(map[string]Rule), nil
 	}
-
-	ruleQuery = strings.TrimSpace(ruleQuery)
-
-	for id, rule := range rules {
-		if ruleQuery == id || ruleQuery == rule.Name {
-			return &rule, nil
-		}
-	}
-
-	return nil, nil
 }
 
-func (uf UnifiFirewall) SetRuleEnabled(ruleQuery string, enabled bool) error {
+func (uf *UnifiFirewall) Login() error {
+	type LoginRequest struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return err
+	}
+	uf.client.Jar = jar
+
+	reqBytes, err := json.Marshal(LoginRequest{uf.Username, uf.password})
+	if err != nil {
+		return err
+	}
+	path := "/api/auth/login"
+	req, err := http.NewRequest("POST", uf.Host+path, bytes.NewBuffer(reqBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+
+	log.WithFields(log.Fields{
+		"host":     uf.Host,
+		"username": uf.Username,
+	}).Info("Logging in...")
+	resp, err := uf.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		log.WithFields(log.Fields{
+			"host":        uf.Host,
+			"username":    uf.Username,
+			"status_code": resp.StatusCode,
+		}).Error("Failed to login")
+		return fmt.Errorf("failed to login: %d", resp.StatusCode)
+	}
+
+	cookies := resp.Cookies()
+	for _, cookie := range cookies {
+		if cookie.Name != "TOKEN" {
+			continue
+		}
+
+		log.WithFields(log.Fields{
+			"host":     uf.Host,
+			"username": uf.Username,
+			"token":    cookie.Value,
+		}).Debug("Received token cookie")
+
+		token, _ := jwt.Parse(cookie.Value, nil)
+		if token == nil {
+			log.WithFields(log.Fields{
+				"host":     uf.Host,
+				"username": uf.Username,
+			}).Error("Token is malformed")
+			return fmt.Errorf("token is malformed")
+		}
+
+		uf.csrfToken = token.Claims.(jwt.MapClaims)["csrfToken"].(string)
+	}
+
+	return nil
+}
+
+func (uf UnifiFirewall) setRuleEnabled(ruleQuery string, enabled bool) error {
 	rule, err := uf.FindRule(ruleQuery)
 	if err != nil {
 		return err
@@ -235,7 +267,10 @@ func (uf UnifiFirewall) SetRuleEnabled(ruleQuery string, enabled bool) error {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+
+	if resp.StatusCode == 401 {
+		return errNeedsLogin
+	} else if resp.StatusCode != 200 {
 		log.WithFields(log.Fields{
 			"host":        uf.Host,
 			"rule_id":     rule.ID,
@@ -251,6 +286,32 @@ func (uf UnifiFirewall) SetRuleEnabled(ruleQuery string, enabled bool) error {
 	}).Info("Successfully updated rule")
 
 	return nil
+}
+
+func (uf *UnifiFirewall) doAndMaybeLogin(f func() (any, error)) (any, error) {
+	val, err := f()
+	if err == nil {
+		return val, nil
+	}
+
+	if errors.Is(err, errNeedsLogin) {
+		if err := uf.Login(); err != nil {
+			log.WithFields(log.Fields{
+				"host": uf.Host,
+			}).Error("Failed to long")
+			return nil, err
+		}
+		return f()
+	} else {
+		return nil, err
+	}
+}
+
+func (uf *UnifiFirewall) SetRuleEnabled(ruleQuery string, enabled bool) error {
+	_, err := uf.doAndMaybeLogin(func() (any, error) {
+		return nil, uf.setRuleEnabled(ruleQuery, enabled)
+	})
+	return err
 }
 
 func run() error {
@@ -269,12 +330,6 @@ func run() error {
 	if host == "" {
 		host = os.Getenv("UNIFI_HOST")
 	}
-
-	unifiFirewall, err := NewUnifiFirewall(host)
-	if err != nil {
-		return err
-	}
-
 	username := *usernameArg
 	if username == "" {
 		username = os.Getenv("UNIFI_USER")
@@ -284,11 +339,11 @@ func run() error {
 		password = os.Getenv("UNIFI_PASS")
 	}
 
-	if err := unifiFirewall.Login(username, password); err != nil {
+	unifiFirewall, err := NewUnifiFirewall(host, username, password)
+	if err != nil {
 		return err
 	}
 
-	// Check for valid auth
 	rules, err := unifiFirewall.GetRules()
 	if err != nil {
 		return err
