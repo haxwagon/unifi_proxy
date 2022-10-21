@@ -10,13 +10,15 @@ COPY . /app
 # Set working directory
 WORKDIR /app
  
-# Run command as described:
-# go build will build an executable file named server in the current directory
-RUN go build -o server . 
-
 ENV UNIFI_USER=""
 ENV UNIFI_PASS=""
 ENV UNIFI_HOST=""
+
+EXPOSE 8080
+
+# Run command as described:
+# go build will build an executable file named server in the current directory
+RUN GOOS=linux GOARCH=amd64 go build -o server . 
 
 # Run the server executable
 CMD [ "/app/server", "--insecure", "--port=8080" ]
