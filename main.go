@@ -65,8 +65,8 @@ func NewUnifiFirewall(host, username, password string) (*UnifiFirewall, error) {
 	}, nil
 }
 
-func (uf *UnifiFirewall) findRule(ruleQuery string) (*Rule, error) {
-	rules, err := uf.getRules()
+func (uf *UnifiFirewall) FindRule(ruleQuery string) (*Rule, error) {
+	rules, err := uf.GetRules()
 	if err != nil {
 		return nil, err
 	}
@@ -82,78 +82,58 @@ func (uf *UnifiFirewall) findRule(ruleQuery string) (*Rule, error) {
 	return nil, nil
 }
 
-func (uf *UnifiFirewall) FindRule(ruleQuery string) (*Rule, error) {
-	val, err := uf.doAndMaybeLogin(func() (any, error) {
-		return uf.findRule(ruleQuery)
-	})
-	if err != nil {
-		return nil, err
-	} else {
-		return val.(*Rule), nil
-	}
-}
-
-func (uf *UnifiFirewall) getRules() (map[string]Rule, error) {
+func (uf *UnifiFirewall) GetRules() (map[string]Rule, error) {
 	type ListRulesResponse struct {
 		Meta  map[string]string `json:"meta"`
 		Rules []Rule            `json:"data"`
 	}
 
-	req, err := http.NewRequest("GET", uf.Host+"/proxy/network/api/s/default/rest/firewallrule", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
+	return doAndMaybeLogin(uf.Login, func() (map[string]Rule, error) {
+		req, err := http.NewRequest("GET", uf.Host+"/proxy/network/api/s/default/rest/firewallrule", nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/json")
 
-	log.WithFields(log.Fields{
-		"host": uf.Host,
-	}).Info("Listing rules...")
-	resp, err := uf.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 401 {
-		return nil, errNeedsLogin
-	} else if resp.StatusCode != 200 {
 		log.WithFields(log.Fields{
-			"host":        uf.Host,
-			"status_code": resp.StatusCode,
-		}).Error("Failed to list rules")
-		return nil, fmt.Errorf("failed to list rules: %d", resp.StatusCode)
-	}
+			"host": uf.Host,
+		}).Info("Listing rules...")
+		resp, err := uf.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
 
-	listRulesBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	var rules ListRulesResponse
-	if err := json.Unmarshal(listRulesBytes, &rules); err != nil {
-		return nil, err
-	}
+		if resp.StatusCode == 401 {
+			return nil, errNeedsLogin
+		} else if resp.StatusCode != 200 {
+			log.WithFields(log.Fields{
+				"host":        uf.Host,
+				"status_code": resp.StatusCode,
+			}).Error("Failed to list rules")
+			return nil, fmt.Errorf("failed to list rules: %d", resp.StatusCode)
+		}
 
-	log.WithFields(log.Fields{
-		"rules": string(listRulesBytes),
-	}).Debug("List rules response")
+		listRulesBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		var rules ListRulesResponse
+		if err := json.Unmarshal(listRulesBytes, &rules); err != nil {
+			return nil, err
+		}
 
-	ruleIdToRule := make(map[string]Rule)
-	for _, rule := range rules.Rules {
-		ruleIdToRule[rule.ID] = rule
-	}
+		log.WithFields(log.Fields{
+			"rules": string(listRulesBytes),
+		}).Debug("List rules response")
 
-	return ruleIdToRule, nil
-}
+		ruleIdToRule := make(map[string]Rule)
+		for _, rule := range rules.Rules {
+			ruleIdToRule[rule.ID] = rule
+		}
 
-func (uf *UnifiFirewall) GetRules() (map[string]Rule, error) {
-	val, err := uf.doAndMaybeLogin(func() (any, error) {
-		return uf.getRules()
+		return ruleIdToRule, nil
 	})
-	if err != nil {
-		return nil, err
-	} else {
-		return val.(map[string]Rule), nil
-	}
 }
 
 func (uf *UnifiFirewall) Login() error {
@@ -225,93 +205,89 @@ func (uf *UnifiFirewall) Login() error {
 	return nil
 }
 
-func (uf UnifiFirewall) setRuleEnabled(ruleQuery string, enabled bool) error {
-	rule, err := uf.FindRule(ruleQuery)
-	if err != nil {
-		return err
-	}
+func (uf *UnifiFirewall) SetRuleEnabled(ruleQuery string, enabled bool) error {
+	setRuleEnabled := func() error {
+		rule, err := uf.FindRule(ruleQuery)
+		if err != nil {
+			return err
+		}
 
-	if rule == nil {
-		log.Infof("No rule found for %s", ruleQuery)
-		return nil
-	}
+		if rule == nil {
+			log.Infof("No rule found for %s", ruleQuery)
+			return nil
+		}
 
-	if enabled == rule.Enabled {
-		log.Infof("Rule %s is already enabled=%s", ruleQuery, enabled)
-		return nil
-	}
+		if enabled == rule.Enabled {
+			log.Infof("Rule %s is already enabled=%s", ruleQuery, enabled)
+			return nil
+		}
 
-	type EnableRequest struct {
-		Enabled bool `json:"enabled"`
-	}
+		type EnableRequest struct {
+			Enabled bool `json:"enabled"`
+		}
 
-	reqBytes, err := json.Marshal(EnableRequest{enabled})
-	if err != nil {
-		return err
-	}
+		reqBytes, err := json.Marshal(EnableRequest{enabled})
+		if err != nil {
+			return err
+		}
 
-	req, err := http.NewRequest("PUT", uf.Host+"/proxy/network/api/s/default/rest/firewallrule/"+rule.ID, bytes.NewBuffer(reqBytes))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-csrf-token", uf.csrfToken)
+		req, err := http.NewRequest("PUT", uf.Host+"/proxy/network/api/s/default/rest/firewallrule/"+rule.ID, bytes.NewBuffer(reqBytes))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-csrf-token", uf.csrfToken)
 
-	log.WithFields(log.Fields{
-		"host":    uf.Host,
-		"rule_id": rule.ID,
-	}).Info("Updating rule...")
-	resp, err := uf.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 401 {
-		return errNeedsLogin
-	} else if resp.StatusCode != 200 {
 		log.WithFields(log.Fields{
-			"host":        uf.Host,
-			"rule_id":     rule.ID,
-			"status_code": resp.StatusCode,
-		}).Error("Failed to update rule")
-		return fmt.Errorf("failed to update rule %s: %d", rule.ID, resp.StatusCode)
+			"host":    uf.Host,
+			"rule_id": rule.ID,
+		}).Info("Updating rule...")
+		resp, err := uf.client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == 401 {
+			return errNeedsLogin
+		} else if resp.StatusCode != 200 {
+			log.WithFields(log.Fields{
+				"host":        uf.Host,
+				"rule_id":     rule.ID,
+				"status_code": resp.StatusCode,
+			}).Error("Failed to update rule")
+			return fmt.Errorf("failed to update rule %s: %d", rule.ID, resp.StatusCode)
+		}
+
+		log.WithFields(log.Fields{
+			"enabled": enabled,
+			"host":    uf.Host,
+			"rule_id": rule.ID,
+		}).Info("Successfully updated rule")
+
+		return nil
 	}
-
-	log.WithFields(log.Fields{
-		"enabled": enabled,
-		"host":    uf.Host,
-		"rule_id": rule.ID,
-	}).Info("Successfully updated rule")
-
-	return nil
+	_, err := doAndMaybeLogin(uf.Login, func() (any, error) {
+		return nil, setRuleEnabled()
+	})
+	return err
 }
 
-func (uf *UnifiFirewall) doAndMaybeLogin(f func() (any, error)) (any, error) {
+func doAndMaybeLogin[v any](login func() error, f func() (v, error)) (v, error) {
 	val, err := f()
 	if err == nil {
 		return val, nil
 	}
 
 	if errors.Is(err, errNeedsLogin) {
-		if err := uf.Login(); err != nil {
-			log.WithFields(log.Fields{
-				"host": uf.Host,
-			}).Error("Failed to long")
-			return nil, err
+		if err := login(); err != nil {
+			return val, err
 		}
 		return f()
 	} else {
-		return nil, err
+		return val, err
 	}
-}
-
-func (uf *UnifiFirewall) SetRuleEnabled(ruleQuery string, enabled bool) error {
-	_, err := uf.doAndMaybeLogin(func() (any, error) {
-		return nil, uf.setRuleEnabled(ruleQuery, enabled)
-	})
-	return err
 }
 
 func run() error {
